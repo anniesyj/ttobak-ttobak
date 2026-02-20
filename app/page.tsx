@@ -1,24 +1,18 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { supabase } from "@/lib/supabaseClient";
 
 type Mode = "easy" | "summary" | "checklist";
 
 const FREE_LIMIT = 5;
-const USAGE_KEY = "ttobak_usage_count_v1";
 
-const TRIAL_ACTIVE_KEY = "ttobak_trial_active_v1";
-const TRIAL_EMAIL_KEY = "ttobak_trial_email_v1";
-const TRIAL_START_KEY = "ttobak_trial_start_v1";
-const TRIAL_DAYS = 7;
-
-function isValidEmail(email: string) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
-}
-
-function daysLeftFrom(startMs: number) {
-  const msLeft = startMs + TRIAL_DAYS * 24 * 60 * 60 * 1000 - Date.now();
-  return Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
+function todayISO() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 export default function Home() {
@@ -26,74 +20,91 @@ export default function Home() {
   const [output, setOutput] = useState("");
   const [loading, setLoading] = useState(false);
 
-  // usage
-  const [usageCount, setUsageCount] = useState(0);
-  const remaining = useMemo(() => Math.max(0, FREE_LIMIT - usageCount), [usageCount]);
-
-  // trial
-  const [trialEmail, setTrialEmail] = useState("");
-  const [trialActive, setTrialActive] = useState(false);
-  const [trialStartMs, setTrialStartMs] = useState<number | null>(null);
-
-  const proActive = useMemo(() => {
-    if (!trialActive || !trialStartMs) return false;
-    return daysLeftFrom(trialStartMs) > 0;
-  }, [trialActive, trialStartMs]);
-
-  const trialDaysLeft = useMemo(() => {
-    if (!trialStartMs) return 0;
-    return daysLeftFrom(trialStartMs);
-  }, [trialStartMs]);
-
   const [mode, setMode] = useState<Mode>("easy");
 
-  // modal
-  const [paywallOpen, setPaywallOpen] = useState(false);
+  // auth
+  const [userId, setUserId] = useState<string | null>(null);
+  const [email, setEmail] = useState<string>("");
+
+  // plan & usage
+  const [isPro, setIsPro] = useState(false);
+  const [usageCount, setUsageCount] = useState(0);
+
+  const remaining = useMemo(() => Math.max(0, FREE_LIMIT - usageCount), [usageCount]);
+
+  const modeLabel: Record<Mode, string> = {
+    easy: "쉬운 문장",
+    summary: "3줄 요약",
+    checklist: "체크리스트",
+  };
 
   useEffect(() => {
-    try {
-      const saved = Number(localStorage.getItem(USAGE_KEY) || 0);
-      setUsageCount(Number.isFinite(saved) ? saved : 0);
-    } catch {}
-
-    try {
-      setTrialEmail(localStorage.getItem(TRIAL_EMAIL_KEY) || "");
-    } catch {}
-
-    try {
-      const active = localStorage.getItem(TRIAL_ACTIVE_KEY) === "true";
-      setTrialActive(active);
-    } catch {}
-
-    try {
-      const start = Number(localStorage.getItem(TRIAL_START_KEY) || 0);
-      setTrialStartMs(start > 0 ? start : null);
-    } catch {}
-
-    // auto-expire
-    try {
-      const start = Number(localStorage.getItem(TRIAL_START_KEY) || 0);
-      const active = localStorage.getItem(TRIAL_ACTIVE_KEY) === "true";
-      if (active && start > 0 && daysLeftFrom(start) <= 0) {
-        localStorage.setItem(TRIAL_ACTIVE_KEY, "false");
-        setTrialActive(false);
+    // 로그인 상태 확인
+    supabase.auth.getSession().then(async ({ data }) => {
+      const session = data.session;
+      if (!session) {
+        window.location.href = "/login";
+        return;
       }
-    } catch {}
+      setUserId(session.user.id);
+      setEmail(session.user.email ?? "");
+
+      await loadProfile(session.user.id, session.user.email ?? "");
+      await loadTodayUsage(session.user.id);
+    });
+
+    // 세션 변경 감지
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!session) window.location.href = "/login";
+    });
+
+    return () => {
+      sub.subscription.unsubscribe();
+    };
   }, []);
 
-  function persistUsage(next: number) {
-    setUsageCount(next);
-    try {
-      localStorage.setItem(USAGE_KEY, String(next));
-    } catch {}
+  async function loadProfile(uid: string, mail: string) {
+    // profiles 없으면 upsert
+    await supabase.from("profiles").upsert({ id: uid, email: mail });
+
+    const { data } = await supabase.from("profiles").select("is_pro").eq("id", uid).single();
+    setIsPro(Boolean(data?.is_pro));
+  }
+
+  async function loadTodayUsage(uid: string) {
+    const day = todayISO();
+    // row 없으면 생성
+    await supabase.from("usage_daily").upsert({ user_id: uid, day, count: 0 });
+
+    const { data } = await supabase
+      .from("usage_daily")
+      .select("count")
+      .eq("user_id", uid)
+      .eq("day", day)
+      .single();
+
+    setUsageCount(Number(data?.count ?? 0));
+  }
+
+  async function incrementUsage(uid: string) {
+    const day = todayISO();
+    const next = usageCount + 1;
+
+    const { error } = await supabase
+      .from("usage_daily")
+      .update({ count: next })
+      .eq("user_id", uid)
+      .eq("day", day);
+
+    if (!error) setUsageCount(next);
   }
 
   async function run() {
     if (!text.trim()) return;
+    if (!userId) return;
 
-    if (!proActive && usageCount >= FREE_LIMIT) {
-      setOutput("무료 사용 횟수를 모두 사용했어요. Pro 7일 체험을 시작하면 무제한으로 사용할 수 있어요.");
-      setPaywallOpen(true);
+    if (!isPro && usageCount >= FREE_LIMIT) {
+      setOutput("무료 사용 횟수를 모두 사용했어요. Pro로 업그레이드하면 무제한으로 사용할 수 있어요.");
       return;
     }
 
@@ -110,7 +121,7 @@ export default function Home() {
       const data = await res.json().catch(() => ({} as any));
       if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
 
-      if (!proActive) persistUsage(usageCount + 1);
+      if (!isPro) await incrementUsage(userId);
       setOutput(data.output);
     } catch (e: any) {
       setOutput(`오류: ${e?.message || "요청 실패"}`);
@@ -119,24 +130,22 @@ export default function Home() {
     }
   }
 
-  function startTrial() {
-    const email = trialEmail.trim();
-    if (!isValidEmail(email)) {
-      setOutput("이메일 형식이 올바르지 않아요. 예: name@example.com");
-      return;
-    }
+  async function logout() {
+    await supabase.auth.signOut();
+    window.location.href = "/login";
+  }
 
-    const now = Date.now();
-    try {
-      localStorage.setItem(TRIAL_EMAIL_KEY, email);
-      localStorage.setItem(TRIAL_START_KEY, String(now));
-      localStorage.setItem(TRIAL_ACTIVE_KEY, "true");
-    } catch {}
+  // 데모용: Pro 토글(실결제 붙이기 전 해커톤 시연용)
+  async function enableProDemo() {
+    if (!userId) return;
+    const { error } = await supabase.from("profiles").update({ is_pro: true }).eq("id", userId);
+    if (!error) setIsPro(true);
+  }
 
-    setTrialStartMs(now);
-    setTrialActive(true);
-    setPaywallOpen(false);
-    setOutput("✅ Pro 7일 체험이 활성화됐어요! 이제 무제한으로 사용할 수 있어요.");
+  async function disableProDemo() {
+    if (!userId) return;
+    const { error } = await supabase.from("profiles").update({ is_pro: false }).eq("id", userId);
+    if (!error) setIsPro(false);
   }
 
   async function copyOutput() {
@@ -149,23 +158,13 @@ export default function Home() {
     }
   }
 
-  const modeLabel: Record<Mode, string> = {
-    easy: "쉬운 문장",
-    summary: "3줄 요약",
-    checklist: "체크리스트",
-  };
-
   return (
     <main className="min-h-screen bg-white text-slate-900">
       <div className="mx-auto max-w-3xl px-6 py-16">
         {/* Header */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <img
-              src="/ttobakttobak_logo_v1.png"
-              alt="또박또박 로고"
-              className="h-10 w-10 object-contain"
-            />
+            <img src="/ttobakttobak_logo_v1.png" alt="또박또박 로고" className="h-10 w-10 object-contain" />
             <div>
               <div className="text-lg font-semibold tracking-tight">또박또박</div>
               <div className="text-xs text-slate-500">읽기 편하게, 이해하기 쉽게.</div>
@@ -173,15 +172,35 @@ export default function Home() {
           </div>
 
           <div className="flex items-center gap-3">
+            <div className="hidden text-xs text-slate-500 sm:block">{email}</div>
             <div className="text-xs text-slate-500">
-              {proActive ? `PRO Trial (${trialDaysLeft}일)` : `Free ${remaining}/${FREE_LIMIT}`}
+              {isPro ? "PRO" : `Free ${remaining}/${FREE_LIMIT}`}
             </div>
+
+            {!isPro ? (
+              <button
+                onClick={enableProDemo}
+                className="rounded-full bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+                type="button"
+              >
+                Pro 업그레이드
+              </button>
+            ) : (
+              <button
+                onClick={disableProDemo}
+                className="rounded-full bg-slate-100 px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-200"
+                type="button"
+              >
+                Pro 해제(데모)
+              </button>
+            )}
+
             <button
-              onClick={() => setPaywallOpen(true)}
-              className="rounded-full bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+              onClick={logout}
+              className="rounded-full bg-slate-100 px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-200"
               type="button"
             >
-              {proActive ? "Pro 관리" : "Pro 업그레이드"}
+              로그아웃
             </button>
           </div>
         </div>
@@ -258,83 +277,6 @@ export default function Home() {
           © {new Date().getFullYear()} 또박또박
         </div>
       </div>
-
-      {/* Paywall modal */}
-      {paywallOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-6">
-          <div className="w-full max-w-md rounded-3xl bg-white p-6 shadow-xl">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <div className="text-lg font-semibold">
-                  {proActive ? "Pro 상태" : "Pro 업그레이드"}
-                </div>
-                <div className="mt-1 text-sm text-slate-500">
-                  {proActive
-                    ? `현재 Pro Trial 사용 중입니다. (${trialDaysLeft}일 남음)`
-                    : "Pro를 시작하면 7일 동안 무제한으로 사용할 수 있어요."}
-                </div>
-              </div>
-              <button
-                onClick={() => setPaywallOpen(false)}
-                className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-200"
-                type="button"
-              >
-                닫기
-              </button>
-            </div>
-
-            <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
-              <div className="font-semibold">요금</div>
-              <div className="mt-1 text-slate-600">
-                Pro: 월 ₩4,900 (해커톤 데모: 결제 온보딩 승인 대기 → 체험 플로우로 시연)
-              </div>
-            </div>
-
-            {!proActive ? (
-              <div className="mt-5">
-                <label className="text-xs font-semibold text-slate-700">이메일</label>
-                <input
-                  value={trialEmail}
-                  onChange={(e) => setTrialEmail(e.target.value)}
-                  className="mt-2 w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-slate-200"
-                  placeholder="name@example.com"
-                />
-                <button
-                  onClick={startTrial}
-                  className="mt-4 w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white hover:bg-slate-800"
-                  type="button"
-                >
-                  Pro 7일 체험 시작
-                </button>
-                <div className="mt-3 text-[11px] leading-4 text-slate-500">
-                  * 이메일은 체험 활성화 확인용으로만 사용합니다.
-                </div>
-              </div>
-            ) : (
-              <div className="mt-5">
-                <button
-                  onClick={() => {
-                    try {
-                      localStorage.removeItem(TRIAL_EMAIL_KEY);
-                      localStorage.removeItem(TRIAL_START_KEY);
-                      localStorage.setItem(TRIAL_ACTIVE_KEY, "false");
-                    } catch {}
-                    setTrialEmail("");
-                    setTrialStartMs(null);
-                    setTrialActive(false);
-                    setOutput("Pro 체험 상태를 초기화했어요. (데모용)");
-                    setPaywallOpen(false);
-                  }}
-                  className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-800 hover:bg-slate-50"
-                  type="button"
-                >
-                  (데모) Pro 초기화
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
     </main>
   );
 }

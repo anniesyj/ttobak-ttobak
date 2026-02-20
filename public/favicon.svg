@@ -1,0 +1,10 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <circle cx="256" cy="256" r="256" fill="#0f172a"/>
+
+  <!-- Speech Bubble -->
+  <path d="M140 180C140 150 165 130 200 130H312C347 130 372 150 372 180V260C372 290 347 310 312 310H250L210 350V310H200C165 310 140 290 140 260V180Z" fill="white"/>
+
+  <!-- Dot inside -->
+  <circle cx="256" cy="220" r="18" fill="#0f172a"/>
+</svg>
